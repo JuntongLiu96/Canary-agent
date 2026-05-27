@@ -62,6 +62,8 @@ async def _spawn_subagent(subagent_def: dict[str, Any], description: str, prompt
         registry=_build_registry(),
         skills_index=skills_index,
         subagents_index=[],  # subagents can't recurse by default
+        mcp_tools_index=mcp_hub.tools if mcp_hub else [],
+        mcp_prompts_index=mcp_hub.prompts if mcp_hub else [],
         allow_tools=subagent_def.get("tools"),
         extra_system=subagent_def.get("body", ""),
     )
@@ -113,6 +115,9 @@ def _get_or_create_session(sid: str, model: str | None) -> Session:
     sess.registry = _build_registry()
     sess.skills_index = skills_index
     sess.subagents_index = subagents_index
+    if mcp_hub is not None:
+        sess.mcp_tools_index = mcp_hub.tools
+        sess.mcp_prompts_index = mcp_hub.prompts
     return sess
 
 
@@ -321,6 +326,89 @@ def _reload_skills_subagents() -> None:
     global skills_index, subagents_index
     skills_index = load_skills()
     subagents_index = load_subagents()
+
+
+# ───────── AgenticEval HTTP adapter (Option A) ─────────
+# https://github.com/.../agentic-eval — expects /eval/health, /eval/run, /eval/judge
+
+class EvalRunRequest(BaseModel):
+    prompt: str
+    metadata: dict[str, Any] = {}
+
+
+class EvalJudgeRequest(BaseModel):
+    messages: list[dict[str, Any]]
+
+
+@app.get("/eval/health")
+async def eval_health():
+    return {"ok": True}
+
+
+def _flatten_for_eval(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Anthropic-shaped (role + content blocks) -> flat [{role, content}] for eval."""
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        role = m["role"]
+        content = m["content"]
+        if isinstance(content, str):
+            out.append({"role": role, "content": content})
+            continue
+        text_parts: list[str] = []
+        for block in content:
+            btype = block.get("type")
+            if btype == "text":
+                text_parts.append(block.get("text", ""))
+            elif btype == "tool_use":
+                args_json = json.dumps(block.get("input", {}), ensure_ascii=False)
+                text_parts.append(f"[tool_use {block.get('name','')}({args_json})]")
+            elif btype == "tool_result":
+                tc = block.get("content", "")
+                if isinstance(tc, list):
+                    tc = "".join(b.get("text", "") for b in tc if b.get("type") == "text")
+                tool_role = "tool"
+                out.append({"role": tool_role, "content": str(tc)})
+                continue
+        if text_parts:
+            out.append({"role": role, "content": "\n".join(text_parts)})
+    return out
+
+
+@app.post("/eval/run")
+async def eval_run(req: EvalRunRequest):
+    """Fresh agent session for each eval case."""
+    sess = Session(model=DEFAULT_MODEL)
+    sess.registry = _build_registry()
+    sess.skills_index = skills_index
+    sess.subagents_index = subagents_index
+    if mcp_hub is not None:
+        sess.mcp_tools_index = mcp_hub.tools
+        sess.mcp_prompts_index = mcp_hub.prompts
+    try:
+        async for _ev in run_agent(sess, req.prompt):
+            pass
+    except Exception as e:
+        return {"messages": _flatten_for_eval(sess.messages), "metadata": {"error": repr(e)}}
+    return {"messages": _flatten_for_eval(sess.messages), "metadata": {}}
+
+
+@app.post("/eval/judge")
+async def eval_judge(req: EvalJudgeRequest):
+    """Raw LLM call — no agent loop, no system prompt injection."""
+    model = DEFAULT_MODEL
+    # Use OpenAI-compatible endpoint always (judge expects /chat/completions semantics).
+    payload = {
+        "model": model,
+        "messages": req.messages,
+        "stream": False,
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(f"{COPILOT_BASE_URL}/v1/chat/completions", json=payload)
+        if r.status_code != 200:
+            raise HTTPException(500, f"judge LLM error: {r.status_code} {r.text}")
+        obj = r.json()
+    content = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+    return {"content": content}
 
 
 app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")

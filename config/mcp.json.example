@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "_example_memory": {
+      "command": "evomem-memsvc-mcp",
+      "args": [],
+      "env": {
+        "MEMSVC_BASE_URL": "http://localhost:9200",
+        "MEMSVC_ORG_ID": "you",
+        "MEMSVC_REPO_ID": "canary-agent",
+        "MEMSVC_AGENT_ID": "canary"
+      }
+    },
+    "_example_browser": {
+      "command": "node",
+      "args": ["C:/path/to/browser-mcp/dist/mcp-server.js"]
+    }
+  }
+}

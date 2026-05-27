@@ -21,6 +21,8 @@ class Session:
     registry: ToolRegistry = field(default_factory=ToolRegistry)
     skills_index: list[dict[str, str]] = field(default_factory=list)
     subagents_index: list[dict[str, str]] = field(default_factory=list)
+    mcp_tools_index: list[dict[str, str]] = field(default_factory=list)    # {server, name, description}
+    mcp_prompts_index: list[dict[str, str]] = field(default_factory=list)  # {server, name, description}
     allow_tools: list[str] | None = None  # name patterns; None = all
     extra_system: str = ""
 
@@ -33,6 +35,23 @@ def build_system_prompt(session: Session) -> str:
         "and delegate to subagents via the Agent tool. Be concise.",
         f"Working directory: {cwd}",
     ]
+    if session.mcp_tools_index:
+        by_server: dict[str, list[dict[str, str]]] = {}
+        for t in session.mcp_tools_index:
+            by_server.setdefault(t["server"], []).append(t)
+        lines = ["# Available MCP servers"]
+        for server, tools in by_server.items():
+            lines.append(f"## {server}")
+            for t in tools:
+                desc = ((t.get("description") or "").splitlines() or [""])[0][:120]
+                lines.append(f"- mcp__{server}__{t['name']}: {desc}")
+            prompts = [p for p in session.mcp_prompts_index if p["server"] == server]
+            if prompts:
+                lines.append(f"  prompts (user-invokable as /{server}:<name>):")
+                for p in prompts:
+                    desc = ((p.get("description") or "").splitlines() or [""])[0][:120]
+                    lines.append(f"  - {p['name']}: {desc}")
+        parts.append("\n".join(lines))
     if session.skills_index:
         lines = ["# Available skills (invoke with the `Skill` tool):"]
         lines += [f"- {s['name']}: {s['description']}" for s in session.skills_index]
@@ -54,8 +73,12 @@ async def run_agent(session: Session, user_input: str | list[dict[str, Any]]) ->
 
     while True:
         provider = pick_provider(session.model)
-        tools = session.registry.schemas(session.allow_tools)
-        system = build_system_prompt(session)
+        try:
+            tools = session.registry.schemas(session.allow_tools)
+            system = build_system_prompt(session)
+        except Exception as e:
+            yield {"type": "error", "message": f"prompt build failed: {e!r}"}
+            return
 
         assistant_blocks: list[dict[str, Any]] = []
         cur_text: str | None = None
