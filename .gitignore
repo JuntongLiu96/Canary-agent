@@ -20,3 +20,6 @@ build/
 
 # Per-user MCP server config (use config/mcp.json.example as a template)
 config/mcp.json
+
+# Local env (use .env.example as a template)
+.env
