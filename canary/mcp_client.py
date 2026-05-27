@@ -6,6 +6,7 @@ from contextlib import AsyncExitStack
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
+from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
@@ -16,35 +17,49 @@ log = logging.getLogger("canary.mcp")
 
 class MCPHub:
     def __init__(self) -> None:
-        self.stack = AsyncExitStack()
+        # One stack per server, so a failed connect rolls back only its own
+        # resources and doesn't poison the others' lifecycle.
+        self.stacks: dict[str, AsyncExitStack] = {}
         self.sessions: dict[str, ClientSession] = {}
-        # Catalogs: list of dicts, ready to JSON-serve.
-        self.tools: list[dict[str, Any]] = []   # {server, name, description, input_schema}
-        self.prompts: list[dict[str, Any]] = [] # {server, name, description, arguments}
+        self.tools: list[dict[str, Any]] = []
+        self.prompts: list[dict[str, Any]] = []
 
     async def start(self) -> None:
         cfg = load_mcp_config().get("mcpServers", {})
         for server_name, spec in cfg.items():
+            stack = AsyncExitStack()
+            await stack.__aenter__()
             try:
-                session = await self._connect(server_name, spec)
+                session = await self._connect(stack, server_name, spec)
                 self.sessions[server_name] = session
+                self.stacks[server_name] = stack
             except Exception as e:
                 log.warning("MCP server %s failed to start: %s", server_name, e)
+                try:
+                    await stack.__aexit__(type(e), e, e.__traceback__)
+                except Exception as e2:
+                    log.warning("MCP server %s cleanup error: %s", server_name, e2)
         await self.refresh()
 
-    async def _connect(self, name: str, spec: dict[str, Any]) -> ClientSession:
+    async def _connect(self, stack: AsyncExitStack, name: str, spec: dict[str, Any]) -> ClientSession:
         if "url" in spec:
-            read, write, _ = await self.stack.enter_async_context(
-                streamablehttp_client(spec["url"])
-            )
+            url: str = spec["url"]
+            headers = spec.get("headers") or None
+            transport = spec.get("transport") or ("sse" if url.rstrip("/").endswith("/sse") else "http")
+            if transport == "sse":
+                read, write = await stack.enter_async_context(sse_client(url, headers=headers))
+            else:
+                read, write, _ = await stack.enter_async_context(
+                    streamablehttp_client(url, headers=headers)
+                )
         else:
             params = StdioServerParameters(
                 command=spec["command"],
                 args=spec.get("args", []),
                 env=spec.get("env"),
             )
-            read, write = await self.stack.enter_async_context(stdio_client(params))
-        session = await self.stack.enter_async_context(ClientSession(read, write))
+            read, write = await stack.enter_async_context(stdio_client(params))
+        session = await stack.enter_async_context(ClientSession(read, write))
         await session.initialize()
         log.info("MCP connected: %s", name)
         return session
@@ -110,4 +125,10 @@ class MCPHub:
         return out
 
     async def stop(self) -> None:
-        await self.stack.aclose()
+        for name, stack in list(self.stacks.items()):
+            try:
+                await stack.aclose()
+            except Exception as e:
+                log.warning("MCP server %s shutdown error: %s", name, e)
+        self.stacks.clear()
+        self.sessions.clear()
