@@ -71,7 +71,13 @@ async def run_agent(session: Session, user_input: str | list[dict[str, Any]]) ->
     else:
         session.messages.append({"role": "user", "content": user_input})
 
+    max_iterations = 30
+    iteration = 0
     while True:
+        iteration += 1
+        if iteration > max_iterations:
+            yield {"type": "error", "message": f"max iterations ({max_iterations}) exceeded"}
+            return
         provider = pick_provider(session.model)
         try:
             tools = session.registry.schemas(session.allow_tools)

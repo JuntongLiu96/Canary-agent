@@ -14,6 +14,8 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from .agent import Session, run_agent
@@ -30,6 +32,7 @@ from .mcp_client import MCPHub
 from .skills import load_skills, register_skill_tool
 from .tools import ToolRegistry
 from .tools.mcp_tools import register_mcp_tools
+from .tools.memory import MEMORY_POLICY_PROMPT, MEMORY_TOOLS, memory_enabled
 from .tools.native import NATIVE_TOOLS
 from .tools.subagent import load_subagents, register_agent_tool
 
@@ -43,11 +46,17 @@ skills_index: list[dict[str, str]] = []
 subagents_index: list[dict[str, str]] = []
 shared_registry: ToolRegistry = ToolRegistry()
 
+# Prometheus metrics
+cart_aborts_total = Counter('cart_aborts_total', 'Total number of cart aborts')
+
 
 def _build_registry() -> ToolRegistry:
     reg = ToolRegistry()
     for t in NATIVE_TOOLS:
         reg.register(t)
+    if memory_enabled():
+        for t in MEMORY_TOOLS:
+            reg.register(t)
     register_skill_tool(reg, skills_index)
     if mcp_hub is not None:
         register_mcp_tools(reg, mcp_hub)
@@ -118,6 +127,8 @@ def _get_or_create_session(sid: str, model: str | None) -> Session:
     if mcp_hub is not None:
         sess.mcp_tools_index = mcp_hub.tools
         sess.mcp_prompts_index = mcp_hub.prompts
+    if memory_enabled() and MEMORY_POLICY_PROMPT not in sess.extra_system:
+        sess.extra_system = (sess.extra_system + "\n\n" + MEMORY_POLICY_PROMPT).strip()
     return sess
 
 
@@ -220,6 +231,21 @@ async def mcp_refresh():
         raise HTTPException(503)
     await mcp_hub.refresh()
     return {"tools": len(mcp_hub.tools), "prompts": len(mcp_hub.prompts)}
+
+
+# ───────── Cart endpoints ─────────
+
+@app.post("/cart/abort")
+async def cart_abort():
+    """Abort a cart and increment the Prometheus counter."""
+    cart_aborts_total.inc()
+    return {"ok": True, "message": "Cart aborted"}
+
+
+@app.get("/metrics")
+async def metrics():
+    """Expose Prometheus metrics."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 # ───────── Management: edit MCP config, skills, subagents ─────────
@@ -384,6 +410,8 @@ async def eval_run(req: EvalRunRequest):
     if mcp_hub is not None:
         sess.mcp_tools_index = mcp_hub.tools
         sess.mcp_prompts_index = mcp_hub.prompts
+    if memory_enabled():
+        sess.extra_system = MEMORY_POLICY_PROMPT
     try:
         async for _ev in run_agent(sess, req.prompt):
             pass
