@@ -7,7 +7,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shutil
+import tempfile
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -32,7 +36,10 @@ from .mcp_client import MCPHub
 from .skills import load_skills, register_skill_tool
 from .tools import ToolRegistry
 from .tools.mcp_tools import register_mcp_tools
-from .tools.memory import MEMORY_POLICY_PROMPT, MEMORY_TOOLS, memory_enabled
+from .tools.memory import (
+    MEMORY_POLICY_PROMPT, MEMORY_TOOLS, memory_enabled,
+    set_request_scope, reset_request_scope,
+)
 from .tools.native import NATIVE_TOOLS
 from .tools.subagent import load_subagents, register_agent_tool
 
@@ -400,6 +407,149 @@ def _flatten_for_eval(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _compute_eval_metadata(
+    messages: list[dict[str, Any]],
+    must_retrieve_memory_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Self-report agent-side metrics derivable from session.messages.
+
+    Reports only what the agent itself knows. Metrics that require an oracle
+    (n_reduction, files_recall vs expected, fama, etc.) are the harness's job —
+    see docs/11-agent-integration-guide.md.
+
+    When the case declares ``must_retrieve_memory_ids`` (the cards that SHOULD
+    surface), we also compute rank-aware retrieval quality from the passage
+    ids the agent actually saw: ``retrieval_recall_at_k`` (fraction of expected
+    ids present anywhere in the agent's retrievals) and ``retrieval_mrr`` (mean
+    reciprocal rank of the first expected id across retrieval calls). These are
+    strictly better than the binary ``retrieval_hit_rate``, which a case can
+    pass while retrieving the wrong card.
+    """
+    trajectory_steps = 0
+    tool_calls = 0
+    files_touched: set[str] = set()
+    memory_retrievals: list[dict[str, Any]] = []
+    memory_distills: list[dict[str, Any]] = []
+    last_tool_use: dict[str, Any] | None = None
+
+    for m in messages:
+        content = m["content"]
+        if isinstance(content, str):
+            if m["role"] == "assistant":
+                trajectory_steps += 1
+            continue
+        for block in content:
+            btype = block.get("type")
+            if btype == "tool_use":
+                tool_calls += 1
+                trajectory_steps += 1
+                name = block.get("name", "")
+                args = block.get("input", {}) or {}
+                last_tool_use = {"name": name, "args": args}
+                if name in ("write_file", "edit_file", "str_replace") and args.get("path"):
+                    files_touched.add(args["path"])
+                elif name == "memory_distill":
+                    memory_distills.append({"task": args.get("task"), "outcome": args.get("outcome")})
+            elif btype == "tool_result" and last_tool_use:
+                if last_tool_use["name"] == "memory_retrieve":
+                    raw = block.get("content", "")
+                    if isinstance(raw, list):
+                        raw = "".join(b.get("text", "") for b in raw if b.get("type") == "text")
+                    try:
+                        parsed = json.loads(raw) if isinstance(raw, str) else raw
+                        memory_retrievals.append({
+                            "query": last_tool_use["args"].get("query", ""),
+                            "passages": parsed.get("passages", []) if isinstance(parsed, dict) else [],
+                        })
+                    except (json.JSONDecodeError, TypeError):
+                        memory_retrievals.append({"query": last_tool_use["args"].get("query", ""), "passages": []})
+                last_tool_use = None
+
+    retrieval_hit_rate = (
+        sum(1 for r in memory_retrievals if r["passages"]) / len(memory_retrievals)
+        if memory_retrievals else 0.0
+    )
+    out_meta: dict[str, Any] = {
+        "trajectory_steps": trajectory_steps,
+        "tool_calls_count": tool_calls,
+        "files_touched": sorted(files_touched),
+        "memory_retrievals_count": len(memory_retrievals),
+        "memory_distills_count": len(memory_distills),
+        "retrieval_hit_rate": retrieval_hit_rate,
+        "memory_retrievals": memory_retrievals,
+        "memory_distills": memory_distills,
+    }
+
+    # Rank-aware retrieval quality vs the expected card ids (oracle supplied by
+    # the case via metadata.must_retrieve_memory_ids). Only emitted when the
+    # case declares an expectation — otherwise these keys stay absent so a
+    # programmatic scorer doesn't read a vacuous 0.
+    want = [str(i) for i in (must_retrieve_memory_ids or []) if i]
+    if want:
+        want_set = set(want)
+        # Union of all retrieved ids across the agent's retrieval calls.
+        retrieved_ids: set[str] = set()
+        for r in memory_retrievals:
+            for p in r.get("passages", []):
+                mid = p.get("memory_id") if isinstance(p, dict) else None
+                if mid:
+                    retrieved_ids.add(str(mid))
+        recall = len(want_set & retrieved_ids) / len(want_set)
+        # MRR: best (lowest) rank at which ANY expected id appears, per call;
+        # average the reciprocal ranks over calls that returned passages.
+        rr_values: list[float] = []
+        for r in memory_retrievals:
+            passages = r.get("passages", []) or []
+            if not passages:
+                continue
+            best_rank = None
+            for rank, p in enumerate(passages, start=1):
+                mid = str(p.get("memory_id")) if isinstance(p, dict) else None
+                if mid in want_set:
+                    best_rank = rank
+                    break
+            rr_values.append(1.0 / best_rank if best_rank else 0.0)
+        out_meta["retrieval_recall_at_k"] = recall
+        out_meta["retrieval_mrr"] = (sum(rr_values) / len(rr_values)) if rr_values else 0.0
+    return out_meta
+
+
+async def _run_scheduled_erasures(
+    metadata: dict[str, Any], turn_index: int, scope: dict[str, str] | None
+) -> None:
+    """Execute GDPR DELETEs scheduled to fire after ``turn_index``.
+
+    The exporter emits ``metadata.erasure_schedule = {"<turn_index>": [{memory_id,
+    reason}, ...]}`` from the case's ``post_session_N`` blocks. Erasure is a
+    system/compliance action — the agent never deletes. We hit
+    ``DELETE /memory/{id}`` with the case scope so the NEXT turn's retrieval can't
+    surface the erased facts and the tombstone probe sees erased=true + audit_hash.
+    """
+    schedule = metadata.get("erasure_schedule") or {}
+    deletes = schedule.get(str(turn_index)) if isinstance(schedule, dict) else None
+    if not deletes:
+        return
+    s = scope or {}
+    headers = {"X-Org-Id": str(s.get("org_id") or "")}
+    if s.get("repo_id"):
+        headers["X-Repo-Id"] = str(s["repo_id"])
+    if s.get("agent_id"):
+        headers["X-Agent-Id"] = str(s["agent_id"])
+    tok = os.environ.get("MEMSVC_TOKEN", "")
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    memsvc = os.environ.get("MEMSVC_BASE_URL", "http://localhost:9200")
+    async with httpx.AsyncClient(base_url=memsvc, timeout=30, headers=headers) as c:
+        for d in deletes:
+            mid = d.get("memory_id") if isinstance(d, dict) else None
+            if not mid:
+                continue
+            try:
+                await c.delete(f"/memory/{mid}", params={"reason": d.get("reason", "user-request")})
+            except Exception as e:
+                log.warning("scheduled erasure of %s failed: %s", mid, e)
+
+
 @app.post("/eval/run")
 async def eval_run(req: EvalRunRequest):
     """Fresh agent session for each eval case."""
@@ -412,12 +562,97 @@ async def eval_run(req: EvalRunRequest):
         sess.mcp_prompts_index = mcp_hub.prompts
     if memory_enabled():
         sess.extra_system = MEMORY_POLICY_PROMPT
+
+    # Materialize env_state.files (from testcase metadata) into a tempdir
+    # and chdir there so write_file / read_file / edit_file tools see them
+    # as the working tree. See docs/11-agent-integration-guide.md
+    # (env_state.files contract).
+    env_state = (req.metadata or {}).get("env_state") or {}
+    files = env_state.get("files") if isinstance(env_state, dict) else None
+    tmpdir: str | None = None
+    prev_cwd: str | None = None
+    if isinstance(files, dict) and files:
+        tmpdir = tempfile.mkdtemp(prefix="evomem-case-")
+        for rel, content in files.items():
+            dest = Path(tmpdir) / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content if isinstance(content, str) else str(content), encoding="utf-8")
+        prev_cwd = os.getcwd()
+        os.chdir(tmpdir)
+
+    # AE-3: per-request memory scope from testcase_metadata.scope; falls back to
+    # MEMSVC_* env. Without this every distill lands under the env-var scope and
+    # cross-case retrieval is empty.
+    scope = (req.metadata or {}).get("scope") or None
+    scope_token = set_request_scope(scope) if scope else None
+
+    # Which turn of a multi-session case is this? The orchestrator sends
+    # turn_index per turn (0-based). Ingestion seeding and between-session
+    # system actions (GDPR erasure) are turn-sensitive: seed only once, and
+    # run a post_session_N erasure after the turn it follows.
+    turn_index = int((req.metadata or {}).get("turn_index") or 0)
+
+    # Expected card ids for rank-aware retrieval quality (recall@k / MRR). The
+    # exporter lifts these from the case's expected_retrieval.must_retrieve_
+    # memory_ids into testcase metadata; _compute_eval_metadata joins them
+    # against the passages the agent actually retrieved.
+    must_retrieve = (req.metadata or {}).get("must_retrieve_memory_ids") or []
+
+    # Pre-seed the memory store from case.ingestion[] so the very first retrieval
+    # has something to find. Each entry is a full trajectory the case author wants
+    # available before the agent runs. Seed ONLY on turn 0 — re-seeding every turn
+    # would re-distill cards the harness erased in a later turn (GN-004). See
+    # docs/11-agent-integration-guide.md.
+    ingestion = (req.metadata or {}).get("ingestion") or []
+    if ingestion and memory_enabled() and turn_index == 0:
+        memsvc = os.environ.get("MEMSVC_BASE_URL", "http://localhost:9200")
+        async with httpx.AsyncClient(base_url=memsvc, timeout=30) as c:
+            for traj in ingestion:
+                if not isinstance(traj, dict):
+                    continue
+                # Per-trajectory scope_override lets a single case seed cards
+                # under multiple tenants (e.g. GN-006 writes under tenant-a /
+                # tenant-b / tenant-c). Fall back to the case-level scope.
+                traj_scope = traj.get("scope_override") or scope or {}
+                body: dict[str, Any] = {
+                    "task": traj.get("task", ""),
+                    "outcome": traj.get("outcome", "success"),
+                    "trace_steps": traj.get("trace_steps") or [],
+                    "scope": traj_scope,
+                }
+                if traj.get("trajectory_id"):
+                    body["trajectory_id"] = traj["trajectory_id"]
+                if traj.get("ground_truth_distillation"):
+                    body["ground_truth_distillation"] = traj["ground_truth_distillation"]
+                try:
+                    await c.post("/memory/distill", json=body)
+                except Exception as e:
+                    log.warning("ingestion distill failed: %s", e)
     try:
-        async for _ev in run_agent(sess, req.prompt):
-            pass
-    except Exception as e:
-        return {"messages": _flatten_for_eval(sess.messages), "metadata": {"error": repr(e)}}
-    return {"messages": _flatten_for_eval(sess.messages), "metadata": {}}
+        try:
+            async for _ev in run_agent(sess, req.prompt):
+                pass
+        except Exception as e:
+            flat = _flatten_for_eval(sess.messages)
+            meta = _compute_eval_metadata(sess.messages, must_retrieve)
+            meta["error"] = repr(e)
+            return {"messages": flat, "metadata": meta}
+        flat = _flatten_for_eval(sess.messages)
+        meta = _compute_eval_metadata(sess.messages, must_retrieve)
+        # System/compliance erasure: run any DELETEs scheduled to fire AFTER this
+        # turn (GN-004 right-to-be-forgotten). This is NOT an agent action — the
+        # agent has no delete tool; the harness invokes DELETE /memory/{id} on
+        # the data-subject's behalf so the NEXT turn's retrieval can't surface
+        # the erased facts. See docs/11-agent-integration-guide.md.
+        await _run_scheduled_erasures(req.metadata or {}, turn_index, scope)
+        return {"messages": flat, "metadata": meta}
+    finally:
+        if scope_token is not None:
+            reset_request_scope(scope_token)
+        if prev_cwd:
+            os.chdir(prev_cwd)
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @app.post("/eval/judge")
