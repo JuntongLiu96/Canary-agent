@@ -39,9 +39,10 @@ _DISTILL_DESC = (
     "BEFORE calling: run the distillation prompt in "
     "memory_service/docs/distill_prompt.md against your own LLM with task, "
     "outcome, and trajectory substituted in, and pass the resulting JSON as "
-    "`ground_truth`. Without it the server falls back to a low-quality "
-    "heuristic. The server deduplicates against existing cards in scope; you "
-    "may get back the id of an existing card with rising confidence."
+    "`self_distillation` (your own distillation of what you just did). "
+    "Without it the server falls back to a low-quality heuristic. The server "
+    "deduplicates against existing cards in scope; you may get back the id of "
+    "an existing card with rising confidence."
 )
 
 _RATE_DESC = (
@@ -156,8 +157,13 @@ def _norm_outcome(raw: Any) -> str:
     return _OUTCOME_ALIASES.get(str(raw or "").strip().lower(), "success")
 
 
-def _norm_ground_truth(gt: Any, fallback_summary: str = "") -> dict[str, Any] | None:
-    """Sanitise a model-supplied ground_truth so it matches the wire schema.
+def _norm_self_distillation(gt: Any, fallback_summary: str = "") -> dict[str, Any] | None:
+    """Sanitise a model-supplied self_distillation so it matches the wire schema.
+
+    This is the agent's OWN distillation of the trajectory it just ran (Model B
+    — the primary production write path). It is NOT the case oracle: the agent
+    has no access to ground_truth_distillation, which is seeded out-of-band by
+    the harness. Same shape, different provenance.
 
     Drops a non-numeric confidence and forces the list-typed fields to lists,
     so a type deviation can't 422 the whole distill.
@@ -248,9 +254,11 @@ async def _memory_distill(args: dict[str, Any]) -> str:
     }
     if args.get("trajectory_id"):
         body["trajectory_id"] = args["trajectory_id"]
-    gt = _norm_ground_truth(args.get("ground_truth"), trace_summary)
-    if gt:
-        body["ground_truth_distillation"] = gt
+    # Agent's OWN distillation -> self_distillation wire field. The agent has
+    # no access to ground_truth_distillation (seed-only, harness-written).
+    sd = _norm_self_distillation(args.get("self_distillation"), trace_summary)
+    if sd:
+        body["self_distillation"] = sd
     async with _client() as c:
         r = await c.post("/memory/distill", json=body)
     return _truncate(r.text)
@@ -311,7 +319,7 @@ MEMORY_TOOLS: list[Tool] = [
                 "trace_summary": {"type": "string"},
                 "trace_steps": {"type": "array", "items": {"type": "object"}},
                 "trajectory_id": {"type": "string"},
-                "ground_truth": {"type": "object"},
+                "self_distillation": {"type": "object"},
             },
             "required": ["task", "outcome", "trace_summary"],
         },
@@ -353,7 +361,7 @@ MEMORY_POLICY_PROMPT = (
     "investigation, you MUST call memory_distill with the full trace and "
     "an outcome label — skipping this is a defect. Before doing so, run "
     "the distillation prompt at memory_service/docs/distill_prompt.md "
-    "against your own model and pass the JSON as `ground_truth`. Distill "
+    "against your own model and pass the JSON as `self_distillation`. Distill "
     "stable facts and preferences the user volunteers (favorite language, "
     "allergies, environment quirks) using memory_distill with "
     'task=\"user preference: <topic>\", outcome=\"success\". After acting '

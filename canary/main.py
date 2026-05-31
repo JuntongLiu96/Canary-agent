@@ -598,36 +598,14 @@ async def eval_run(req: EvalRunRequest):
     # against the passages the agent actually retrieved.
     must_retrieve = (req.metadata or {}).get("must_retrieve_memory_ids") or []
 
-    # Pre-seed the memory store from case.ingestion[] so the very first retrieval
-    # has something to find. Each entry is a full trajectory the case author wants
-    # available before the agent runs. Seed ONLY on turn 0 — re-seeding every turn
-    # would re-distill cards the harness erased in a later turn (GN-004). See
-    # docs/11-agent-integration-guide.md.
-    ingestion = (req.metadata or {}).get("ingestion") or []
-    if ingestion and memory_enabled() and turn_index == 0:
-        memsvc = os.environ.get("MEMSVC_BASE_URL", "http://localhost:9200")
-        async with httpx.AsyncClient(base_url=memsvc, timeout=30) as c:
-            for traj in ingestion:
-                if not isinstance(traj, dict):
-                    continue
-                # Per-trajectory scope_override lets a single case seed cards
-                # under multiple tenants (e.g. GN-006 writes under tenant-a /
-                # tenant-b / tenant-c). Fall back to the case-level scope.
-                traj_scope = traj.get("scope_override") or scope or {}
-                body: dict[str, Any] = {
-                    "task": traj.get("task", ""),
-                    "outcome": traj.get("outcome", "success"),
-                    "trace_steps": traj.get("trace_steps") or [],
-                    "scope": traj_scope,
-                }
-                if traj.get("trajectory_id"):
-                    body["trajectory_id"] = traj["trajectory_id"]
-                if traj.get("ground_truth_distillation"):
-                    body["ground_truth_distillation"] = traj["ground_truth_distillation"]
-                try:
-                    await c.post("/memory/distill", json=body)
-                except Exception as e:
-                    log.warning("ingestion distill failed: %s", e)
+    # NOTE: case.ingestion[] (prior-run memory the case wants preset) is NOT
+    # seeded here. Seeding through the agent bridge would hand the case oracle
+    # to the very system under test — a cheating path. The eval harness seeds
+    # memsvc out-of-band before the turn loop (agentic-eval
+    # orchestrator -> harness_probes.seed_memory_store), and the standalone
+    # evomem-seed CLI does the same for ad-hoc runs. The agent only ever writes
+    # memory via its own memory_distill tool (self_distillation). See
+    # docs/11-agent-integration-guide.md "Seeding is out-of-band".
     try:
         try:
             async for _ev in run_agent(sess, req.prompt):
